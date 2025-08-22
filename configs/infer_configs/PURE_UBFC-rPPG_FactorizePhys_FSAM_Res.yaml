@@ -6,10 +6,10 @@ TEST:
   DATA:
     FS: 30
     DATASET: UBFC-rPPG
-    DO_PREPROCESS: False               # if first time, should be true
+    DO_PREPROCESS: True              # if first time, should be true
     DATA_FORMAT: NCDHW
-    DATA_PATH: "/mnt/sda/data/raw/UBFC-rPPG/data/"                     # Raw dataset path, need to be updated
-    CACHED_PATH: "/mnt/sda/data/prep/UBFC-rPPG/"    # Processed dataset save path, need to be updated
+    DATA_PATH: "test/RawData"                     # Raw dataset path, need to be updated
+    CACHED_PATH: "test/RawData/out1"   # Processed dataset save path, need to be updated
     EXP_DATA_NAME: ""
     BEGIN: 0.0
     END: 1.0
