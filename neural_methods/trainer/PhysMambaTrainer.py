@@ -3,6 +3,7 @@ import os
 from collections import OrderedDict
 
 import math
+from matplotlib import pyplot as plt
 import numpy as np
 import torch
 import torch.optim as optim
@@ -150,7 +151,11 @@ class PhysMambaTrainer(BaseTrainer):
         if self.config.TOOLBOX_MODE == "only_test":
             if not os.path.exists(self.config.INFERENCE.MODEL_PATH):
                 raise ValueError("Inference model path error! Please check INFERENCE.MODEL_PATH in your yaml.")
-            self.model.load_state_dict(torch.load(self.config.INFERENCE.MODEL_PATH))
+            state_dict = torch.load(self.config.INFERENCE.MODEL_PATH)
+            # Filter out Bi-Mamba weights
+            cleaned_state = {k: v for k, v in state_dict.items() if not any(s in k for s in ['A_b_log','D_b','conv1d_b','x_proj_b','dt_proj_b'])}
+            self.model.load_state_dict(cleaned_state, strict=False)
+
             print("Testing uses pretrained model!")
             print(self.config.INFERENCE.MODEL_PATH)
         else:
@@ -191,9 +196,49 @@ class PhysMambaTrainer(BaseTrainer):
                     labels[subj_index][sort_index] = label[idx]
 
         print('')
-        calculate_metrics(predictions, labels, self.config)
-        if self.config.TEST.OUTPUT_SAVE_DIR: # saving test outputs 
-            self.save_test_outputs(predictions, labels, self.config)
+        # Clean before metrics
+        def has_invalid(arr):
+            return np.any(np.isnan(arr)) or np.any(np.isinf(arr))
+
+        for subj_id in list(predictions.keys()):
+            for i in list(predictions[subj_id].keys()):
+                p = predictions[subj_id][i].detach().cpu().numpy().flatten()
+                l = labels[subj_id][i].detach().cpu().numpy().flatten()
+                if has_invalid(p) or has_invalid(l):
+                    print(f"[WARNING] NaN/Inf detected in subject {subj_id}, index {i}, removing...")
+                    predictions[subj_id].pop(i)
+                    labels[subj_id].pop(i)
+
+        # Plot one example (first subject, first sequence)
+        subj_id = list(predictions.keys())[0]
+        sort_index = sorted(predictions[subj_id].keys())[0]
+
+        pred_seq = predictions[subj_id][sort_index].cpu().numpy().flatten()
+        label_seq = labels[subj_id][sort_index].cpu().numpy().flatten()
+        trim = 10  # e.g., trim first 30 samples
+        label_seq = label_seq[trim:]
+        pred_seq = pred_seq[trim:]
+
+        def normalize(arr):
+            return (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+
+        pred_seq_norm = normalize(pred_seq)
+        label_seq_norm = normalize(label_seq)
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(label_seq_norm, label="Ground Truth (normalized)", linewidth=2)
+        plt.plot(pred_seq_norm, label="Prediction (normalized)", linestyle="--")
+        plt.title(f"Subject {subj_id} - Sequence {sort_index} (Normalized)")
+        plt.legend()
+        plt.show()
+
+
+        # Save first, then show
+        out_path = f"subject_{subj_id}_sequence_{sort_index}_prediction_vs_ground_truth.png"
+        plt.savefig(out_path, dpi=300, bbox_inches="tight")
+        print(f"[INFO] Saved plot to {out_path}")
+        plt.show()
+        plt.close()
 
     def save_model(self, index):
         if not os.path.exists(self.model_dir):
