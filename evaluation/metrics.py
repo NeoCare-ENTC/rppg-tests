@@ -215,3 +215,47 @@ def calculate_metrics(predictions, labels, config):
                 raise ValueError("Wrong Test Metric Type")
     else:
         raise ValueError("Inference evaluation method name wrong!")
+
+def calculate_hr(predictions, config):
+    """Calculate rPPG Metrics (MAE, RMSE, MAPE, Pearson Coef.)."""
+    predict_hr_all = list()
+    print("Calculating HR!")
+    for index in predictions.keys():
+        prediction = _reform_data_from_dict(predictions[index])
+
+        video_frame_size = prediction.shape[0]
+        if config.INFERENCE.EVALUATION_WINDOW.USE_SMALLER_WINDOW:
+            window_frame_size = config.INFERENCE.EVALUATION_WINDOW.WINDOW_SIZE * config.TEST.DATA.FS
+            if window_frame_size > video_frame_size:
+                window_frame_size = video_frame_size
+        else:
+            window_frame_size = video_frame_size
+
+        for i in range(0, len(prediction), window_frame_size):
+            pred_window = prediction[i:i+window_frame_size]
+
+            if len(pred_window) < 9:
+                print(f"Window frame size of {len(pred_window)} is smaller than minimum pad length of 9. Window ignored!")
+                continue
+
+            if config.TEST.DATA.PREPROCESS.LABEL_TYPE == "Standardized" or \
+                    config.TEST.DATA.PREPROCESS.LABEL_TYPE == "Raw":
+                diff_flag_test = False
+            elif config.TEST.DATA.PREPROCESS.LABEL_TYPE == "DiffNormalized":
+                diff_flag_test = True
+            else:
+                raise ValueError("Unsupported label type in testing!")
+            
+            if config.INFERENCE.EVALUATION_METHOD == "peak detection":
+                pred_hr_peak = calculate_hr_per_video(
+                    pred_window, diff_flag=diff_flag_test, fs=config.TEST.DATA.FS, hr_method='Peak')
+                predict_hr_all.append(pred_hr_peak)
+            elif config.INFERENCE.EVALUATION_METHOD == "FFT":
+                pred_hr_fft = calculate_hr_per_video(
+                    pred_window, diff_flag=diff_flag_test, fs=config.TEST.DATA.FS, hr_method='FFT')
+                predict_hr_all.append(pred_hr_fft)
+            else:
+                raise ValueError("Inference evaluation method name wrong!")
+            
+    
+    return np.array(predict_hr_all)
