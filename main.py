@@ -66,8 +66,6 @@ def train_and_test(config, data_loader_dict):
         model_trainer = trainer.PhysnetTrainer.PhysnetTrainer(config, data_loader_dict)
     elif config.MODEL.NAME == "iBVPNet":
         model_trainer = trainer.iBVPNetTrainer.iBVPNetTrainer(config, data_loader_dict)
-    elif config.MODEL.NAME == "FactorizePhys":
-        model_trainer = trainer.FactorizePhysTrainer.FactorizePhysTrainer(config, data_loader_dict)
     elif config.MODEL.NAME == "Tscan":
         model_trainer = trainer.TscanTrainer.TscanTrainer(config, data_loader_dict)
     elif config.MODEL.NAME == "EfficientPhys":
@@ -78,10 +76,6 @@ def train_and_test(config, data_loader_dict):
         model_trainer = trainer.BigSmallTrainer.BigSmallTrainer(config, data_loader_dict)
     elif config.MODEL.NAME == 'PhysFormer':
         model_trainer = trainer.PhysFormerTrainer.PhysFormerTrainer(config, data_loader_dict)
-    elif config.MODEL.NAME == 'PhysMamba':
-        model_trainer = trainer.PhysMambaTrainer.PhysMambaTrainer(config, data_loader_dict)
-    elif config.MODEL.NAME == 'RhythmFormer':
-        model_trainer = trainer.RhythmFormerTrainer.RhythmFormerTrainer(config, data_loader_dict)
     else:
         raise ValueError('Your Model is Not Supported  Yet!')
     model_trainer.train(data_loader_dict)
@@ -94,8 +88,6 @@ def test(config, data_loader_dict):
         model_trainer = trainer.PhysnetTrainer.PhysnetTrainer(config, data_loader_dict)
     elif config.MODEL.NAME == "iBVPNet":
         model_trainer = trainer.iBVPNetTrainer.iBVPNetTrainer(config, data_loader_dict)    
-    elif config.MODEL.NAME == "FactorizePhys":
-        model_trainer = trainer.FactorizePhysTrainer.FactorizePhysTrainer(config, data_loader_dict)
     elif config.MODEL.NAME == "Tscan":
         model_trainer = trainer.TscanTrainer.TscanTrainer(config, data_loader_dict)
     elif config.MODEL.NAME == "EfficientPhys":
@@ -106,13 +98,10 @@ def test(config, data_loader_dict):
         model_trainer = trainer.BigSmallTrainer.BigSmallTrainer(config, data_loader_dict)
     elif config.MODEL.NAME == 'PhysFormer':
         model_trainer = trainer.PhysFormerTrainer.PhysFormerTrainer(config, data_loader_dict)
-    elif config.MODEL.NAME == 'PhysMamba':
-        model_trainer = trainer.PhysMambaTrainer.PhysMambaTrainer(config, data_loader_dict)
-    elif config.MODEL.NAME == 'RhythmFormer':
-        model_trainer = trainer.RhythmFormerTrainer.RhythmFormerTrainer(config, data_loader_dict)
     else:
         raise ValueError('Your Model is Not Supported  Yet!')
     model_trainer.test(data_loader_dict)
+
 
 if __name__ == "__main__":
     # parse arguments.
@@ -146,8 +135,12 @@ if __name__ == "__main__":
             train_loader = data_loader.UBFCPHYSLoader.UBFCPHYSLoader
         elif config.TRAIN.DATA.DATASET == "iBVP":
             train_loader = data_loader.iBVPLoader.iBVPLoader
-        elif config.TRAIN.DATA.DATASET == "PhysDrive":
-            train_loader = data_loader.PhysDriveLoader.PhysDriveLoader
+        elif config.TRAIN.DATA.DATASET == "VIPL-HR":
+            train_loader = data_loader.VIPLLoader.VIPLLoader
+        elif config.TRAIN.DATA.DATASET == "NBHR":
+            train_loader = data_loader.NBHRLoader.NBHRLoader
+        elif config.TRAIN.DATA.DATASET == "VideoPulse":
+            train_loader = data_loader.VideoPulseLoader.VideoPulseLoader
         else:
             raise ValueError("Unsupported dataset! Currently supporting UBFC-rPPG, PURE, MMPD, \
                              SCAMPS, BP4D+ (Normal and BigSmall preprocessing), UBFC-PHYS and iBVP.")
@@ -156,11 +149,11 @@ if __name__ == "__main__":
         # a supported dataset name, and a valid dataset paths
         if (config.TRAIN.DATA.DATASET and config.TRAIN.DATA.DATA_PATH):
 
+
             train_data_loader = train_loader(
                 name="train",
                 data_path=config.TRAIN.DATA.DATA_PATH,
-                config_data=config.TRAIN.DATA,
-                device=config.DEVICE)
+                config_data=config.TRAIN.DATA)
             data_loader_dict['train'] = DataLoader(
                 dataset=train_data_loader,
                 num_workers=16,
@@ -189,8 +182,12 @@ if __name__ == "__main__":
             valid_loader = data_loader.UBFCPHYSLoader.UBFCPHYSLoader
         elif config.VALID.DATA.DATASET == "iBVP":
             valid_loader = data_loader.iBVPLoader.iBVPLoader
-        elif config.VALID.DATA.DATASET == "PhysDrive":
-            valid_loader = data_loader.PhysDriveLoader.PhysDriveLoader
+        elif config.TRAIN.DATA.DATASET == "VIPL-HR":
+            valid_loader = data_loader.VIPLLoader.VIPLLoader
+        elif config.TRAIN.DATA.DATASET == "NBHR":
+            valid_loader = data_loader.NBHRLoader.NBHRLoader
+        elif config.TRAIN.DATA.DATASET == "VideoPulse":
+            valid_loader = data_loader.VideoPulseLoader.VideoPulseLoader
         elif config.VALID.DATA.DATASET is None and not config.TEST.USE_LAST_EPOCH:
             raise ValueError("Validation dataset not specified despite USE_LAST_EPOCH set to False!")
         else:
@@ -203,8 +200,7 @@ if __name__ == "__main__":
             valid_data = valid_loader(
                 name="valid",
                 data_path=config.VALID.DATA.DATA_PATH,
-                config_data=config.VALID.DATA,
-                device=config.DEVICE)
+                config_data=config.VALID.DATA)
             data_loader_dict["valid"] = DataLoader(
                 dataset=valid_data,
                 num_workers=16,
@@ -234,8 +230,12 @@ if __name__ == "__main__":
             test_loader = data_loader.UBFCPHYSLoader.UBFCPHYSLoader
         elif config.TEST.DATA.DATASET == "iBVP":
             test_loader = data_loader.iBVPLoader.iBVPLoader
-        elif config.TEST.DATA.DATASET == "PhysDrive":
-            test_loader = data_loader.PhysDriveLoader.PhysDriveLoader
+        elif config.TRAIN.DATA.DATASET == "VIPL-HR":
+            test_loader = data_loader.VIPLLoader.VIPLLoader
+        elif config.TEST.DATA.DATASET == "NBHR":
+            test_loader = data_loader.NBHRLoader.NBHRLoader
+        elif config.TEST.DATA.DATASET == "VideoPulse":
+            test_loader = data_loader.VideoPulseLoader.VideoPulseLoader
         else:
             raise ValueError("Unsupported dataset! Currently supporting UBFC-rPPG, PURE, MMPD, \
                              SCAMPS, BP4D+ (Normal and BigSmall preprocessing), UBFC-PHYS and iBVP.")
@@ -247,10 +247,9 @@ if __name__ == "__main__":
         # a supported dataset name, and a valid dataset path
         if config.TEST.DATA.DATASET and config.TEST.DATA.DATA_PATH:
             test_data = test_loader(
-                name="",
+                name="test",
                 data_path=config.TEST.DATA.DATA_PATH,
-                config_data=config.TEST.DATA,
-                device=config.DEVICE)
+                config_data=config.TEST.DATA)
             data_loader_dict["test"] = DataLoader(
                 dataset=test_data,
                 num_workers=16,
@@ -285,8 +284,7 @@ if __name__ == "__main__":
         unsupervised_data = unsupervised_loader(
             name="unsupervised",
             data_path=config.UNSUPERVISED.DATA.DATA_PATH,
-            config_data=config.UNSUPERVISED.DATA,
-            device=config.DEVICE)
+            config_data=config.UNSUPERVISED.DATA)
         data_loader_dict["unsupervised"] = DataLoader(
             dataset=unsupervised_data,
             num_workers=16,
