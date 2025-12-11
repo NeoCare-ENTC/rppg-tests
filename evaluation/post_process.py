@@ -130,8 +130,18 @@ def _calculate_SNR(pred_ppg_signal, hr_label, fs=30, low_pass=0.6, high_pass=3.3
         SNR = 0
     return SNR
 
-def calculate_metric_per_video(predictions, labels, fs=30, diff_flag=True, use_bandpass=True, hr_method='FFT'):
-    """Calculate video-level HR and SNR"""
+def calculate_metric_per_video(predictions, labels, fs=30, diff_flag=True, use_bandpass=True, hr_method='FFT', gt_hr=None):
+    """Calculate video-level HR and SNR
+    
+    Args:
+        predictions: predicted PPG signal
+        labels: ground truth PPG signal
+        fs: sampling frequency
+        diff_flag: whether signals are 1st derivative
+        use_bandpass: whether to apply bandpass filter
+        hr_method: 'FFT' or 'Peak' for HR calculation
+        gt_hr: optional pre-calculated ground truth HR (for NBHR dataset with CSV mean HR)
+    """
     if diff_flag:  # if the predictions and labels are 1st derivative of PPG signal.
         predictions = _detrend(np.cumsum(predictions), 100)
         labels = _detrend(np.cumsum(labels), 100)
@@ -153,10 +163,12 @@ def calculate_metric_per_video(predictions, labels, fs=30, diff_flag=True, use_b
 
     if hr_method == 'FFT':
         hr_pred = _calculate_fft_hr(predictions, fs=fs)
-        hr_label = _calculate_fft_hr(labels, fs=fs)
+        # Use pre-calculated GT HR if provided (NBHR dataset), otherwise calculate from signal
+        hr_label = gt_hr if gt_hr is not None else _calculate_fft_hr(labels, fs=fs)
     elif hr_method == 'Peak':
         hr_pred = _calculate_peak_hr(predictions, fs=fs)
-        hr_label = _calculate_peak_hr(labels, fs=fs)
+        # Use pre-calculated GT HR if provided (NBHR dataset), otherwise calculate from signal
+        hr_label = gt_hr if gt_hr is not None else _calculate_peak_hr(labels, fs=fs)
     else:
         raise ValueError('Please use FFT or Peak to calculate your HR.')
     SNR = _calculate_SNR(predictions, hr_label, fs=fs)
