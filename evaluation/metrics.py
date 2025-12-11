@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 import torch
 from evaluation.post_process import *
+from evaluation.post_process import _calculate_fft_hr, _calculate_peak_hr, _detrend
+from scipy.signal import butter, filtfilt
 from tqdm import tqdm
 from evaluation.BlandAltmanPy import BlandAltman
 
@@ -42,18 +44,36 @@ def _reform_data_from_dict(data, flatten=True):
     return sort_data
 
 
-def calculate_metrics(predictions, labels, config):
-    """Calculate rPPG Metrics (MAE, RMSE, MAPE, Pearson Coef.)."""
+def calculate_metrics(predictions, labels, config, mean_hrs=None):
+    """Calculate rPPG Metrics (MAE, RMSE, MAPE, Pearson Coef.).
+    
+    Args:
+        predictions: Dictionary of predicted signals
+        labels: Dictionary of ground truth signals
+        config: Configuration object
+        mean_hrs: Optional dictionary of mean HR values from CSV (for NBHR dataset)
+    """
     predict_hr_fft_all = list()
     gt_hr_fft_all = list()
     predict_hr_peak_all = list()
     gt_hr_peak_all = list()
     SNR_all = list()
     MACC_all = list()
+    
+    # Store per-video HR values for CSV export
+    video_hr_records = list()
+    
     print("Calculating metrics!")
     for index in tqdm(predictions.keys(), ncols=80):
         prediction = _reform_data_from_dict(predictions[index])
         label = _reform_data_from_dict(labels[index])
+        
+        # Get mean_hr for this video if available (NBHR dataset)
+        mean_hr_value = None
+        if mean_hrs and index in mean_hrs:
+            # Get the mean of all chunk mean_hrs for this video
+            mean_hr_chunks = list(mean_hrs[index].values())
+            mean_hr_value = np.mean(mean_hr_chunks)
 
         video_frame_size = prediction.shape[0]
         if config.INFERENCE.EVALUATION_WINDOW.USE_SMALLER_WINDOW:
@@ -80,19 +100,51 @@ def calculate_metrics(predictions, labels, config):
                 raise ValueError("Unsupported label type in testing!")
             
             if config.INFERENCE.EVALUATION_METHOD == "peak detection":
+                # Pass mean_hr_value as gt_hr parameter (None for non-NBHR datasets)
                 gt_hr_peak, pred_hr_peak, SNR, macc = calculate_metric_per_video(
-                    pred_window, label_window, diff_flag=diff_flag_test, fs=config.TEST.DATA.FS, hr_method='Peak')
+                    pred_window, label_window, diff_flag=diff_flag_test, fs=config.TEST.DATA.FS, 
+                    hr_method='Peak', gt_hr=mean_hr_value)
+                
                 gt_hr_peak_all.append(gt_hr_peak)
                 predict_hr_peak_all.append(pred_hr_peak)
                 SNR_all.append(SNR)
                 MACC_all.append(macc)
+                
+                # Store per-video record
+                video_hr_records.append({
+                    'video_id': index,
+                    'window_index': i // window_frame_size,
+                    'gt_hr': gt_hr_peak,
+                    'predicted_hr': pred_hr_peak,
+                    'error': abs(pred_hr_peak - gt_hr_peak),
+                    'snr': SNR,
+                    'macc': macc,
+                    'method': 'Peak',
+                    'gt_source': 'CSV_mean' if mean_hr_value is not None else 'FFT'
+                })
             elif config.INFERENCE.EVALUATION_METHOD == "FFT":
+                # Pass mean_hr_value as gt_hr parameter (None for non-NBHR datasets)
                 gt_hr_fft, pred_hr_fft, SNR, macc = calculate_metric_per_video(
-                    pred_window, label_window, diff_flag=diff_flag_test, fs=config.TEST.DATA.FS, hr_method='FFT')
+                    pred_window, label_window, diff_flag=diff_flag_test, fs=config.TEST.DATA.FS, 
+                    hr_method='FFT', gt_hr=mean_hr_value)
+                
                 gt_hr_fft_all.append(gt_hr_fft)
                 predict_hr_fft_all.append(pred_hr_fft)
                 SNR_all.append(SNR)
                 MACC_all.append(macc)
+                
+                # Store per-video record
+                video_hr_records.append({
+                    'video_id': index,
+                    'window_index': i // window_frame_size,
+                    'gt_hr': gt_hr_fft,
+                    'predicted_hr': pred_hr_fft,
+                    'error': abs(pred_hr_fft - gt_hr_fft),
+                    'snr': SNR,
+                    'macc': macc,
+                    'method': 'FFT',
+                    'gt_source': 'CSV_mean' if mean_hr_value is not None else 'FFT'
+                })
             else:
                 raise ValueError("Inference evaluation method name wrong!")
     
@@ -104,6 +156,20 @@ def calculate_metrics(predictions, labels, config):
         filename_id = model_file_root + "_" + config.TEST.DATA.DATASET
     else:
         raise ValueError('Metrics.py evaluation only supports train_and_test and only_test!')
+    
+    # Save per-video HR results to CSV
+    if len(video_hr_records) > 0:
+        import os
+        df_hr = pd.DataFrame(video_hr_records)
+        
+        # Create output directory if needed
+        output_dir = config.TEST.OUTPUT_SAVE_DIR if config.TEST.OUTPUT_SAVE_DIR else "test_results"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        csv_filename = os.path.join(output_dir, f"{filename_id}_HR_results.csv")
+        df_hr.to_csv(csv_filename, index=False)
+        print(f"\n✓ Saved per-video HR results to: {csv_filename}")
+        print(f"  Total videos/windows: {len(video_hr_records)}")
 
     if config.INFERENCE.EVALUATION_METHOD == "FFT":
         gt_hr_fft_all = np.array(gt_hr_fft_all)
@@ -215,6 +281,18 @@ def calculate_metrics(predictions, labels, config):
                 raise ValueError("Wrong Test Metric Type")
     else:
         raise ValueError("Inference evaluation method name wrong!")
+    
+    # Print summary of saved HR results
+    if len(video_hr_records) > 0:
+        print("\n" + "="*60)
+        print("PER-VIDEO HR RESULTS SUMMARY")
+        print("="*60)
+        print(f"Sample results (first 5 videos):")
+        for i, record in enumerate(video_hr_records[:5]):
+            print(f"  {record['video_id']} [Win {record['window_index']}]: GT={record['gt_hr']:.2f} bpm, Pred={record['predicted_hr']:.2f} bpm, Error={record['error']:.2f} bpm")
+        if len(video_hr_records) > 5:
+            print(f"  ... and {len(video_hr_records) - 5} more")
+        print("="*60)
 
 def calculate_hr(predictions, config):
     """Calculate rPPG Metrics (MAE, RMSE, MAPE, Pearson Coef.)."""
