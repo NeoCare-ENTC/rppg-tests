@@ -1,19 +1,17 @@
 """PhysNet Trainer."""
-import json
 import os
 from collections import OrderedDict
-import pandas as pd
+
 import numpy as np
 import torch
 import torch.optim as optim
-from evaluation.metrics import calculate_hr
+from evaluation.metrics import calculate_metrics
 from neural_methods.loss.PhysNetNegPearsonLoss import Neg_Pearson
 from neural_methods.model.PhysNet import PhysNet_padding_Encoder_Decoder_MAX
 from neural_methods.trainer.BaseTrainer import BaseTrainer
 from torch.autograd import Variable
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-
+from scipy.signal import welch
 
 class PhysnetTrainer(BaseTrainer):
 
@@ -66,12 +64,16 @@ class PhysnetTrainer(BaseTrainer):
                 tbar.set_description("Train epoch %s" % epoch)
                 rPPG, x_visual, x_visual3232, x_visual1616 = self.model(
                     batch[0].to(torch.float32).to(self.device))
-                BVP_label = batch[1].to(
+                BVP_label = np.squeeze(batch[1][:,0:1,:], axis=1).to(
                     torch.float32).to(self.device)
                 rPPG = (rPPG - torch.mean(rPPG)) / torch.std(rPPG)  # normalize
                 BVP_label = (BVP_label - torch.mean(BVP_label)) / \
                             torch.std(BVP_label)  # normalize
                 loss = self.loss_model(rPPG, BVP_label)
+                if torch.isinf(loss) or torch.isnan(loss):
+                    print("Skip the batch")
+                    continue
+                
                 loss.backward()
                 running_loss += loss.item()
                 if idx % 100 == 99:  # print every 100 mini-batches
@@ -93,9 +95,9 @@ class PhysnetTrainer(BaseTrainer):
 
             self.save_model(epoch)
             if not self.config.TEST.USE_LAST_EPOCH: 
-                valid_loss = self.valid(data_loader)
+                valid_loss, RMSE = self.valid(data_loader)
                 mean_valid_losses.append(valid_loss)
-                print('validation loss: ', valid_loss)
+                print('validation loss:', valid_loss, " RMSE:", RMSE)
                 if self.min_valid_loss is None:
                     self.min_valid_loss = valid_loss
                     self.best_epoch = epoch
@@ -122,9 +124,10 @@ class PhysnetTrainer(BaseTrainer):
         valid_step = 0
         with torch.no_grad():
             vbar = tqdm(data_loader["valid"], ncols=80)
+            hrs = []
             for valid_idx, valid_batch in enumerate(vbar):
                 vbar.set_description("Validation")
-                BVP_label = valid_batch[1].to(
+                BVP_label = np.squeeze(valid_batch[1][:,0:1,:], axis=1).to(
                     torch.float32).to(self.device)
                 rPPG, x_visual, x_visual3232, x_visual1616 = self.model(
                     valid_batch[0].to(torch.float32).to(self.device))
@@ -132,11 +135,15 @@ class PhysnetTrainer(BaseTrainer):
                 BVP_label = (BVP_label - torch.mean(BVP_label)) / \
                             torch.std(BVP_label)  # normalize
                 loss_ecg = self.loss_model(rPPG, BVP_label)
+                for _1, _2 in zip(rPPG, BVP_label):
+                    hrs.append((self.get_hr(_1.cpu().detach().numpy()), self.get_hr(_2.cpu().detach().numpy())))
+            
                 valid_loss.append(loss_ecg.item())
                 valid_step += 1
                 vbar.set_postfix(loss=loss_ecg.item())
             valid_loss = np.asarray(valid_loss)
-        return np.mean(valid_loss)
+            RMSE = np.mean([(i-j)**2 for i, j in hrs])**0.5
+        return np.mean(valid_loss), RMSE
 
     def test(self, data_loader):
         """ Runs the model on test sets."""
@@ -157,7 +164,7 @@ class PhysnetTrainer(BaseTrainer):
         else:
             if self.config.TEST.USE_LAST_EPOCH:
                 last_epoch_model_path = os.path.join(
-                    self.model_dir, self.model_file_name + '_Epoch' + str(self.max_epoch_num - 1) + '.pth')
+                self.model_dir, self.model_file_name + '_Epoch' + str(self.max_epoch_num - 1) + '.pth')
                 print("Testing uses last epoch as non-pretrained model!")
                 print(last_epoch_model_path)
                 self.model.load_state_dict(torch.load(last_epoch_model_path))
@@ -171,12 +178,16 @@ class PhysnetTrainer(BaseTrainer):
         self.model = self.model.to(self.config.DEVICE)
         self.model.eval()
         print("Running model evaluation on the testing dataset!")
+        mean_hrs = dict()  # Store mean_hr values if available
         with torch.no_grad():
             for _, test_batch in enumerate(tqdm(data_loader["test"], ncols=80)):
                 batch_size = test_batch[0].shape[0]
                 data, label = test_batch[0].to(
                     self.config.DEVICE), test_batch[1].to(self.config.DEVICE)
                 pred_ppg_test, _, _, _ = self.model(data)
+
+                # Check if mean_hr is provided (5th element for NBHR dataset)
+                has_mean_hr = len(test_batch) == 5
 
                 if self.config.TEST.OUTPUT_SAVE_DIR:
                     label = label.cpu()
@@ -188,13 +199,17 @@ class PhysnetTrainer(BaseTrainer):
                     if subj_index not in predictions.keys():
                         predictions[subj_index] = dict()
                         labels[subj_index] = dict()
+                        if has_mean_hr:
+                            mean_hrs[subj_index] = dict()
                     predictions[subj_index][sort_index] = pred_ppg_test[idx]
                     labels[subj_index][sort_index] = label[idx]
+                    if has_mean_hr:
+                        mean_hrs[subj_index][sort_index] = test_batch[4][idx].item()
 
         print('')
-        calculate_hr(labels, self.config)
-        calculate_hr(predictions, self.config)
-
+        calculate_metrics(predictions, labels, self.config, mean_hrs if mean_hrs else None)
+        if self.config.TEST.OUTPUT_SAVE_DIR: # saving test outputs 
+            self.save_test_outputs(predictions, labels, self.config)
 
     def save_model(self, index):
         if not os.path.exists(self.model_dir):
@@ -203,3 +218,7 @@ class PhysnetTrainer(BaseTrainer):
             self.model_dir, self.model_file_name + '_Epoch' + str(index) + '.pth')
         torch.save(self.model.state_dict(), model_path)
         print('Saved Model Path: ', model_path)
+
+    def get_hr(self, y, sr=12, min=30, max=180):
+        p, q = welch(y, sr, nfft=1e5/sr, nperseg=np.min((len(y)-1, 256)))
+        return p[(p>min/60)&(p<max/60)][np.argmax(q[(p>min/60)&(p<max/60)])]*60
