@@ -14,12 +14,15 @@ from scipy import signal
 from scipy import sparse
 import math
 from multiprocessing import Pool, Process, Value, Array, Manager
+import sys
 
 import cv2
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
 from tqdm import tqdm
+sys.path.append("/home/ddew0188/ASK/yoloface")
+from face_detector import YoloDetector
 
 
 class BaseLoader(Dataset):
@@ -352,62 +355,31 @@ class BaseLoader(Dataset):
                 mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
                 mask = (mask > 0.5).astype(np.uint8)  # Binarize mask
                 return face_box_coor, mask
-            
-      elif backend == "HC":
-          # Use OpenCV's Haar Cascade algorithm implementation for face detection
-          detector = cv2.CascadeClassifier('./dataset/haarcascade_frontalface_default.xml')
-          face_zone = detector.detectMultiScale(frame)
-
-          if len(face_zone) < 1:
-              print("ERROR: No Face Detected")
-              face_box_coor = [0, 0, frame.shape[0], frame.shape[1]]
-          elif len(face_zone) >= 2:
-              max_width_index = np.argmax(face_zone[:, 2])  # Index of the largest face
-              face_box_coor = face_zone[max_width_index]
-              print("Warning: More than one face detected. Cropping the largest one.")
-          else:
-              face_box_coor = face_zone[0]
-      elif backend == "RF":
-          # Use RetinaFace for face detection
-          res = RetinaFace.detect_faces(frame)
-          print("Type of res:", type(res))  # Debug: Print the type of `res`
-          if isinstance(res, tuple):
-              if len(res)>= 2:  # Assume tuple contains (bounding_boxes, scores)
-                  print("First element:", res[0])
-                  print("Second element:", res[1])
-                  bounding_boxes, scores = res
-                  if len(bounding_boxes) > 0:
-                      # Pick the bounding box with the highest score
-                      highest_score_idx = np.argmax(scores)
-                      face_zone = bounding_boxes[highest_score_idx]
-                      x_min, y_min, x_max, y_max = face_zone
-                      x = x_min
-                      y = y_min
-                      width = x_max - x_min
-                      height = y_max - y_min
-                      face_box_coor = [x, y, width, height]
-                  else:
-                      print("No faces detected in tuple.")
-                      face_box_coor = [0, 0, frame.shape[0], frame.shape[1]]
-              else:
-                  print("Unexpected tuple structure:", res)
-                  face_box_coor = [0, 0, frame.shape[0], frame.shape[1]]
-          elif isinstance(res, dict):
-              if len(res) > 0:
-                  highest_score_face = max(res.values(), key=lambda x: x['score'])
-                  face_zone = highest_score_face['facial_area']
-                  x_min, y_min, x_max, y_max = face_zone
-                  x = x_min
-                  y = y_min
-                  width = x_max - x_min
-                  height = y_max - y_min
-                  face_box_coor = [x, y, width, height]
-              else:
-                  print("Empty dictionary: No faces detected.")
-                  face_box_coor = [0, 0, frame.shape[0], frame.shape[1]]
-          else:
-              print("ERROR: Unexpected return type from RetinaFace.detect_faces():", type(res))
-              face_box_coor = [0, 0, frame.shape[0], frame.shape[1]]
+      elif backend == "YOLOv5":
+        frame_height, frame_width = frame.shape[:2]  
+        model = YoloDetector(target_size=None,device='cpu', min_face=80)
+        bboxes, points = model.predict(frame)
+        # print(bboxes[0])
+        
+        if len(bboxes[0]) == 0:
+            # print(f"ERROR: No Face Detected in {filename}")
+            right_rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            bboxes, points = model.predict(right_rotated_frame)
+            if len(bboxes[0]) == 0:
+                left_rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                bboxes, points = model.predict(left_rotated_frame)
+                if len(bboxes[0]) == 0:
+                    return 0
+                else:
+                    face_box_coor = [bboxes[0][0][1], frame_height-bboxes[0][0][2], bboxes[0][0][3], frame_height-bboxes[0][0][0]]
+            else:
+                face_box_coor = [frame_width-bboxes[0][0][3], bboxes[0][0][0], frame_width-bboxes[0][0][1], bboxes[0][0][2]]
+            # return 0
+            # face_box_coor = [0, 0, frame.shape[1], frame.shape[0]]  # Use entire frame as fallback
+        else:
+            # print(f"Face Detected in {filename}")
+            face_box_coor = bboxes[0][0] # Use the first detected bounding box
+          
       else:
           raise ValueError("Unsupported face detection backend!")
 
@@ -504,6 +476,8 @@ class BaseLoader(Dataset):
                 if use_median_box:
                     face_region = face_region_median
                 else:
+                    # Clamp reference_index to available face regions
+                    reference_index = min(reference_index, len(face_region_all) - 1)
                     face_region = face_region_all[reference_index]
                 
                 # Step 1: Crop the frame to the detected region
@@ -816,7 +790,3 @@ class BaseLoader(Dataset):
             np.linspace(
                 1, input_signal.shape[0], target_length), np.linspace(
                 1, input_signal.shape[0], input_signal.shape[0]), input_signal)
-
-    def get_hr(self, y, sr=12, min=30, max=180):
-        p, q = welch(y, sr, nfft=1e5/sr, nperseg=np.min((len(y)-1, 256)))
-        return p[(p>min/60)&(p<max/60)][np.argmax(q[(p>min/60)&(p<max/60)])]*60
