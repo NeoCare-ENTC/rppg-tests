@@ -90,7 +90,7 @@ class BlandAltman():
                     figure_size=(4,4), show_legend=True,
                     the_title=' ',
                     file_name='BlandAltman_ScatterPlot.pdf',
-                    is_journal=False, measure_lower_lim=40, measure_upper_lim=150):
+                    is_journal=False, measure_lower_lim=90, measure_upper_lim=150):
 
         if is_journal: # avoid use of type 3 fonts for journal paper acceptance
             import matplotlib
