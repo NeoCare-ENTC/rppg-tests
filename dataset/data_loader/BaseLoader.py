@@ -355,6 +355,63 @@ class BaseLoader(Dataset):
                 mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
                 mask = (mask > 0.5).astype(np.uint8)  # Binarize mask
                 return face_box_coor, mask
+      
+      elif backend == "YOLO-RegionBlur":
+        from ultralytics import YOLO
+        
+        model_path = "/srv/data/YU/Neonatal-Facial-Region-Extraction/runs/segment/train/weights/best.pt"
+        if not os.path.exists(model_path):
+            print(f"WARNING: Region detection model not found at {model_path}")
+            print("Falling back to full frame")
+            return [0, 0, frame.shape[1], frame.shape[0]]
+        
+        # Always reinitialize model in each call to ensure it works across multiprocessing
+        if self.region_detector is None:
+            self.region_detector = YOLO(model_path)
+        
+        # YOLO expects BGR format, but frames are stored as RGB in preprocessing pipeline
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        # Run inference with confidence threshold
+        conf_threshold = 0.25
+        results = self.region_detector.predict(frame_bgr, conf=conf_threshold, verbose=False)[0]
+        
+        # Check if any regions detected
+        if results.boxes is None or len(results.boxes) == 0:
+            # Try rotations if no detection
+            right_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_CLOCKWISE)
+            results = self.region_detector.predict(right_rotated_frame, conf=0.15, verbose=False)[0]
+            
+            if results.boxes is None or len(results.boxes) == 0:
+                left_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                results = self.region_detector.predict(left_rotated_frame, conf=0.15, verbose=False)[0]
+                
+                if results.boxes is None or len(results.boxes) == 0:
+                    return 0
+                else:
+                    # Adjust coordinates for left rotation
+                    frame_height, frame_width = frame.shape[:2]
+                    box = results.boxes.xyxy[0].cpu().numpy()
+                    face_box_coor = [box[1], frame_height-box[2], box[3], frame_height-box[0]]
+            else:
+                # Adjust coordinates for right rotation
+                frame_height, frame_width = frame.shape[:2]
+                box = results.boxes.xyxy[0].cpu().numpy()
+                face_box_coor = [frame_width-box[3], box[0], frame_width-box[1], box[2]]
+        else:
+            # Use the detected bounding box (xyxy format -> xywh format)
+            box = results.boxes.xyxy[0].cpu().numpy()
+            x1, y1, x2, y2 = box
+            face_box_coor = [int(x1), int(y1), int(x2-x1), int(y2-y1)]
+            
+            # Extract segmentation mask if requested for blurring
+            if return_mask and results.masks is not None:
+                mask = results.masks.data[0].cpu().numpy()
+                # Resize mask to match frame dimensions
+                mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+                mask = (mask > 0.5).astype(np.uint8)  # Binarize mask
+                return face_box_coor, mask
+      
       elif backend == "YOLOv5":
         frame_height, frame_width = frame.shape[:2]  
         model = YoloDetector(target_size=None,device='cpu', min_face=80)
@@ -456,12 +513,12 @@ class BaseLoader(Dataset):
             # Generate a median bounding box based on all detected face regions
             face_region_median = np.median(face_region_all, axis=0).astype('int')
 
-        # Frame Resizing with optional masking
+        # Frame Resizing with optional masking or blurring
         resized_frames = np.zeros((frames.shape[0], height, width, 3))
         
-        # Get segmentation mask from first frame if using YOLO-Region backend
+        # Get segmentation mask from first frame if using YOLO-Region or YOLO-RegionBlur backend
         segmentation_mask = None
-        if use_face_detection and backend == "YOLO-Region":
+        if use_face_detection and backend in ["YOLO-Region", "YOLO-RegionBlur"]:
             detection_result = self.face_detection(frames[0], backend, use_larger_box, larger_box_coef, filename, return_mask=True)
             if isinstance(detection_result, tuple):
                 _, segmentation_mask = detection_result
@@ -485,15 +542,24 @@ class BaseLoader(Dataset):
                 cropped_frame = frame[max(y, 0):min(y + h, frame.shape[0]),
                                      max(x, 0):min(x + w, frame.shape[1])]
                 
-                # Step 2: Apply mask to cropped frame if available
+                # Step 2: Apply mask or blur to cropped frame if available
                 if segmentation_mask is not None:
                     # Crop the mask to the same region
                     cropped_mask = segmentation_mask[max(y, 0):min(y + h, frame.shape[0]),
                                                     max(x, 0):min(x + w, frame.shape[1])]
-                    # Expand mask to 3 channels
-                    cropped_mask_3ch = np.stack([cropped_mask] * 3, axis=-1)
-                    # Apply mask to cropped frame
-                    cropped_frame = cropped_frame * cropped_mask_3ch
+                    
+                    if backend == "YOLO-RegionBlur":
+                        # Apply blur to non-ROI regions instead of zeroing them
+                        # Expand mask to 3 channels
+                        cropped_mask_3ch = np.stack([cropped_mask] * 3, axis=-1)
+                        # Apply Gaussian blur to the entire frame
+                        blurred_frame = cv2.GaussianBlur(cropped_frame, (21, 21), 0)
+                        # Combine: use original where mask=1, use blurred where mask=0
+                        cropped_frame = cropped_frame * cropped_mask_3ch + blurred_frame * (1 - cropped_mask_3ch)
+                    else:
+                        # YOLO-Region: Apply mask to zero out non-ROI regions
+                        cropped_mask_3ch = np.stack([cropped_mask] * 3, axis=-1)
+                        cropped_frame = cropped_frame * cropped_mask_3ch
                 
                 # Step 3: Resize the cropped (and masked) frame
                 resized_frame = cv2.resize(cropped_frame, (width, height), interpolation=cv2.INTER_AREA)
