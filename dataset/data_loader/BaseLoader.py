@@ -412,6 +412,112 @@ class BaseLoader(Dataset):
                 mask = (mask > 0.5).astype(np.uint8)  # Binarize mask
                 return face_box_coor, mask
       
+      elif backend == "YOLO-RegionTFLite":
+        import tensorflow as tf
+        
+        model_path = "/srv/data/YU/Neonatal-Facial-Region-Extraction/runs/segment/train/weights/best_float32.tflite"
+        if not os.path.exists(model_path):
+            print(f"WARNING: TFLite region detection model not found at {model_path}")
+            print("Falling back to full frame")
+            return [0, 0, frame.shape[1], frame.shape[0]]
+        
+        # Load TFLite model (load once and cache)
+        if self.region_detector is None:
+            self.region_detector = tf.lite.Interpreter(model_path=model_path)
+            self.region_detector.allocate_tensors()
+        
+        interpreter = self.region_detector
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        
+        # Get input shape from model
+        input_shape = input_details[0]['shape']
+        input_height, input_width = input_shape[1], input_shape[2]
+        
+        # Convert RGB to BGR for YOLO
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        # Preprocess frame for TFLite model
+        input_frame = cv2.resize(frame_bgr, (input_width, input_height))
+        input_frame = input_frame.astype(np.float32) / 255.0  # Normalize to [0, 1]
+        input_frame = np.expand_dims(input_frame, axis=0)  # Add batch dimension
+        
+        # Run inference
+        interpreter.set_tensor(input_details[0]['index'], input_frame)
+        interpreter.invoke()
+        
+        # Get outputs - YOLO segmentation typically has multiple outputs
+        # Output 0: boxes (x, y, w, h, confidence, class)
+        # Output 1: masks (segmentation masks)
+        boxes_output = interpreter.get_tensor(output_details[0]['index'])
+        
+        # Parse YOLO output format (may need adjustment based on actual model output)
+        # Assuming output format: [batch, num_detections, 6] where 6 = [x, y, w, h, conf, class]
+        boxes = boxes_output[0]  # Remove batch dimension
+        
+        # Filter by confidence threshold
+        conf_threshold = 0.25
+        valid_detections = boxes[boxes[:, 4] > conf_threshold] if len(boxes.shape) > 1 else []
+        
+        if len(valid_detections) == 0:
+            # Try rotations if no detection
+            right_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_CLOCKWISE)
+            input_frame_rot = cv2.resize(right_rotated_frame, (input_width, input_height))
+            input_frame_rot = input_frame_rot.astype(np.float32) / 255.0
+            input_frame_rot = np.expand_dims(input_frame_rot, axis=0)
+            
+            interpreter.set_tensor(input_details[0]['index'], input_frame_rot)
+            interpreter.invoke()
+            boxes_output = interpreter.get_tensor(output_details[0]['index'])
+            boxes = boxes_output[0]
+            valid_detections = boxes[boxes[:, 4] > 0.15] if len(boxes.shape) > 1 else []
+            
+            if len(valid_detections) == 0:
+                left_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                input_frame_rot = cv2.resize(left_rotated_frame, (input_width, input_height))
+                input_frame_rot = input_frame_rot.astype(np.float32) / 255.0
+                input_frame_rot = np.expand_dims(input_frame_rot, axis=0)
+                
+                interpreter.set_tensor(input_details[0]['index'], input_frame_rot)
+                interpreter.invoke()
+                boxes_output = interpreter.get_tensor(output_details[0]['index'])
+                boxes = boxes_output[0]
+                valid_detections = boxes[boxes[:, 4] > 0.15] if len(boxes.shape) > 1 else []
+                
+                if len(valid_detections) == 0:
+                    return 0
+                else:
+                    # Adjust coordinates for left rotation
+                    frame_height, frame_width = frame.shape[:2]
+                    box = valid_detections[0]
+                    x_center, y_center, w, h = box[0] * frame_width, box[1] * frame_height, box[2] * frame_width, box[3] * frame_height
+                    face_box_coor = [y_center - h/2, frame_height - (x_center + w/2), h, frame_height - (x_center - w/2) - face_box_coor[0]]
+            else:
+                # Adjust coordinates for right rotation
+                frame_height, frame_width = frame.shape[:2]
+                box = valid_detections[0]
+                x_center, y_center, w, h = box[0] * frame_width, box[1] * frame_height, box[2] * frame_width, box[3] * frame_height
+                face_box_coor = [frame_width - (x_center + w/2), y_center - h/2, w, h]
+        else:
+            # Use the first detected bounding box
+            box = valid_detections[0]
+            # Convert normalized coordinates to pixel coordinates
+            frame_height, frame_width = frame.shape[:2]
+            x_center, y_center, w, h = box[0] * frame_width, box[1] * frame_height, box[2] * frame_width, box[3] * frame_height
+            x1 = int(x_center - w/2)
+            y1 = int(y_center - h/2)
+            face_box_coor = [x1, y1, int(w), int(h)]  # [x, y, width, height]
+            
+            # Extract segmentation mask if requested
+            if return_mask and len(output_details) > 1:
+                masks_output = interpreter.get_tensor(output_details[1]['index'])
+                if masks_output is not None and len(masks_output) > 0:
+                    mask = masks_output[0, 0]  # Get first mask from batch
+                    # Resize mask to match frame dimensions
+                    mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+                    mask = (mask > 0.5).astype(np.uint8)  # Binarize mask
+                    return face_box_coor, mask
+      
       elif backend == "YOLOv5":
         frame_height, frame_width = frame.shape[:2]  
         model = YoloDetector(target_size=None,device='cpu', min_face=80)
@@ -516,9 +622,9 @@ class BaseLoader(Dataset):
         # Frame Resizing with optional masking or blurring
         resized_frames = np.zeros((frames.shape[0], height, width, 3))
         
-        # Get segmentation mask from first frame if using YOLO-Region or YOLO-RegionBlur backend
+        # Get segmentation mask from first frame if using YOLO-Region, YOLO-RegionBlur, or YOLO-RegionTFLite backend
         segmentation_mask = None
-        if use_face_detection and backend in ["YOLO-Region", "YOLO-RegionBlur"]:
+        if use_face_detection and backend in ["YOLO-Region", "YOLO-RegionBlur", "YOLO-RegionTFLite"]:
             detection_result = self.face_detection(frames[0], backend, use_larger_box, larger_box_coef, filename, return_mask=True)
             if isinstance(detection_result, tuple):
                 _, segmentation_mask = detection_result
@@ -553,7 +659,7 @@ class BaseLoader(Dataset):
                         # Expand mask to 3 channels
                         cropped_mask_3ch = np.stack([cropped_mask] * 3, axis=-1)
                         # Apply Gaussian blur to the entire frame
-                        blurred_frame = cv2.GaussianBlur(cropped_frame, (21, 21), 0)
+                        blurred_frame = cv2.GaussianBlur(cropped_frame, (63, 63), 0)
                         # Combine: use original where mask=1, use blurred where mask=0
                         cropped_frame = cropped_frame * cropped_mask_3ch + blurred_frame * (1 - cropped_mask_3ch)
                     else:
