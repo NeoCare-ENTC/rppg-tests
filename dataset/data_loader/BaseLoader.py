@@ -21,8 +21,11 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
 from tqdm import tqdm
+from ultralytics import YOLO
 sys.path.append("/home/ddew0188/ASK/yoloface")
 from face_detector import YoloDetector
+
+EYE_CLASS_IDS = (0,)
 
 
 class BaseLoader(Dataset):
@@ -61,6 +64,9 @@ class BaseLoader(Dataset):
         self.config_data = config_data
         self.yolo_detector = None
         self.region_detector = None  # For YOLO-based neonatal region detection
+        self.eye_detector = None  # For eye region detection
+        self.face_detector = None  # For privacy-aware face masking
+        self.face_region_dual_detector = None  # For unified face+region segmentation
         self.detection_stats = None  # Will be initialized in preprocess_dataset
 
         assert (config_data.BEGIN < config_data.END)
@@ -289,17 +295,20 @@ class BaseLoader(Dataset):
 
       Args:
           frame(np.array): a single frame.
-          backend(str): backend to utilize for region detection (supports 'YOLO-Region', 'YOLOv5', 'HC', 'RF').
+          backend(str): backend to utilize for region detection (supports 'YOLO-Region', 'YOLO-RegionBlur',
+                       'YOLO-RegionBlurEyeZero', 'YOLO-RegionBlurEyeDual', 'YOLO-RegionFaceDualBlur', 'YOLO-RegionFaceDualBlurNew', 'YOLO-RegionFaceDualZero',
+                       'YOLOv5', 'HC', 'RF').
           use_larger_box(bool): whether to use a larger bounding box on region detection.
           larger_box_coef(float): Coef. of larger box.
           return_mask(bool): If True, also return the segmentation mask from YOLO.
       Returns:
           face_box_coor(List[int]): coordinates of region bounding box.
           mask(np.array): segmentation mask (only if return_mask=True and backend='YOLO-Region').
+                         For YOLO-RegionBlurEyeZero, returns (region_mask, combined_mask) tuple.
+                         For YOLO-RegionFaceDualBlur / YOLO-RegionFaceDualBlurNew, returns (region_mask, face_mask).
       """
       # YOLO-based neonatal region detection using trained segmentation model
       if backend == "YOLO-Region":
-        from ultralytics import YOLO
         
         model_path = "/srv/data/YU/Neonatal-Facial-Region-Extraction/runs/segment/train/weights/best.pt"
         if not os.path.exists(model_path):
@@ -357,7 +366,61 @@ class BaseLoader(Dataset):
                 return face_box_coor, mask
       
       elif backend == "YOLO-RegionBlur":
-        from ultralytics import YOLO
+        
+        model_path = "/srv/data/YU/Neonatal-Facial-Region-Extraction/runs/segment/train/weights/best.pt"
+        if not os.path.exists(model_path):
+            print(f"WARNING: Region detection model not found at {model_path}")
+            print("Falling back to full frame")
+            return [0, 0, frame.shape[1], frame.shape[0]]
+        
+        # Always reinitialize model in each call to ensure it works across multiprocessing
+        if self.region_detector is None:
+            self.region_detector = YOLO(model_path)
+        
+        # YOLO expects BGR format, but frames are stored as RGB in preprocessing pipeline
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        # Run inference with confidence threshold
+        conf_threshold = 0.25
+        results = self.region_detector.predict(frame_bgr, conf=conf_threshold, verbose=False)[0]
+        
+        # Check if any regions detected
+        if results.boxes is None or len(results.boxes) == 0:
+            # Try rotations if no detection
+            right_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_CLOCKWISE)
+            results = self.region_detector.predict(right_rotated_frame, conf=0.15, verbose=False,)[0]
+            
+            if results.boxes is None or len(results.boxes) == 0:
+                left_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                results = self.region_detector.predict(left_rotated_frame, conf=0.15, verbose=False)[0]
+                
+                if results.boxes is None or len(results.boxes) == 0:
+                    return 0
+                else:
+                    # Adjust coordinates for left rotation
+                    frame_height, frame_width = frame.shape[:2]
+                    box = results.boxes.xyxy[0].cpu().numpy()
+                    face_box_coor = [box[1], frame_height-box[2], box[3], frame_height-box[0]]
+            else:
+                # Adjust coordinates for right rotation
+                frame_height, frame_width = frame.shape[:2]
+                box = results.boxes.xyxy[0].cpu().numpy()
+                face_box_coor = [frame_width-box[3], box[0], frame_width-box[1], box[2]]
+        else:
+            # Use the detected bounding box (xyxy format -> xywh format)
+            box = results.boxes.xyxy[0].cpu().numpy()
+            x1, y1, x2, y2 = box
+            face_box_coor = [int(x1), int(y1), int(x2-x1), int(y2-y1)]
+            
+            # Extract segmentation mask if requested for blurring
+            if return_mask and results.masks is not None:
+                mask = results.masks.data[0].cpu().numpy()
+                # Resize mask to match frame dimensions
+                mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+                mask = (mask > 0.5).astype(np.uint8)  # Binarize mask
+                return face_box_coor, mask
+      
+      elif backend == "YOLO-RegionFeather":
         
         model_path = "/srv/data/YU/Neonatal-Facial-Region-Extraction/runs/segment/train/weights/best.pt"
         if not os.path.exists(model_path):
@@ -404,7 +467,7 @@ class BaseLoader(Dataset):
             x1, y1, x2, y2 = box
             face_box_coor = [int(x1), int(y1), int(x2-x1), int(y2-y1)]
             
-            # Extract segmentation mask if requested for blurring
+            # Extract segmentation mask if requested for feathering
             if return_mask and results.masks is not None:
                 mask = results.masks.data[0].cpu().numpy()
                 # Resize mask to match frame dimensions
@@ -412,146 +475,490 @@ class BaseLoader(Dataset):
                 mask = (mask > 0.5).astype(np.uint8)  # Binarize mask
                 return face_box_coor, mask
       
-      elif backend == "YOLO-RegionTFLite":
-        import tensorflow as tf
+      elif backend == "YOLO-RegionBilateral":
         
-        model_path = "/srv/data/YU/Neonatal-Facial-Region-Extraction/runs/segment/train/weights/best_float32.tflite"
+        model_path = "/srv/data/YU/Neonatal-Facial-Region-Extraction/runs/segment/train/weights/best.pt"
         if not os.path.exists(model_path):
-            print(f"WARNING: TFLite region detection model not found at {model_path}")
+            print(f"WARNING: Region detection model not found at {model_path}")
             print("Falling back to full frame")
             return [0, 0, frame.shape[1], frame.shape[0]]
         
-        # Load TFLite model (load once and cache)
+        # Always reinitialize model in each call to ensure it works across multiprocessing
         if self.region_detector is None:
-            self.region_detector = tf.lite.Interpreter(model_path=model_path)
-            self.region_detector.allocate_tensors()
+            self.region_detector = YOLO(model_path)
         
-        interpreter = self.region_detector
-        input_details = interpreter.get_input_details()
-        output_details = interpreter.get_output_details()
-        
-        # Get input shape from model
-        input_shape = input_details[0]['shape']
-        input_height, input_width = input_shape[1], input_shape[2]
-        
-        # Convert RGB to BGR for YOLO
+        # YOLO expects BGR format, but frames are stored as RGB in preprocessing pipeline
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         
-        # Preprocess frame for TFLite model
-        input_frame = cv2.resize(frame_bgr, (input_width, input_height))
-        input_frame = input_frame.astype(np.float32) / 255.0  # Normalize to [0, 1]
-        input_frame = np.expand_dims(input_frame, axis=0)  # Add batch dimension
-        
-        # Run inference
-        interpreter.set_tensor(input_details[0]['index'], input_frame)
-        interpreter.invoke()
-        
-        # Get outputs - YOLO segmentation typically has multiple outputs
-        # Output 0: boxes (x, y, w, h, confidence, class)
-        # Output 1: masks (segmentation masks)
-        boxes_output = interpreter.get_tensor(output_details[0]['index'])
-        
-        # Parse YOLO output format (may need adjustment based on actual model output)
-        # Assuming output format: [batch, num_detections, 6] where 6 = [x, y, w, h, conf, class]
-        boxes = boxes_output[0]  # Remove batch dimension
-        
-        # Filter by confidence threshold
+        # Run inference with confidence threshold
         conf_threshold = 0.25
-        valid_detections = boxes[boxes[:, 4] > conf_threshold] if len(boxes.shape) > 1 else []
+        results = self.region_detector.predict(frame_bgr, conf=conf_threshold, verbose=False)[0]
         
-        if len(valid_detections) == 0:
+        # Check if any regions detected
+        if results.boxes is None or len(results.boxes) == 0:
             # Try rotations if no detection
             right_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_CLOCKWISE)
-            input_frame_rot = cv2.resize(right_rotated_frame, (input_width, input_height))
-            input_frame_rot = input_frame_rot.astype(np.float32) / 255.0
-            input_frame_rot = np.expand_dims(input_frame_rot, axis=0)
+            results = self.region_detector.predict(right_rotated_frame, conf=0.15, verbose=False)[0]
             
-            interpreter.set_tensor(input_details[0]['index'], input_frame_rot)
-            interpreter.invoke()
-            boxes_output = interpreter.get_tensor(output_details[0]['index'])
-            boxes = boxes_output[0]
-            valid_detections = boxes[boxes[:, 4] > 0.15] if len(boxes.shape) > 1 else []
-            
-            if len(valid_detections) == 0:
+            if results.boxes is None or len(results.boxes) == 0:
                 left_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                input_frame_rot = cv2.resize(left_rotated_frame, (input_width, input_height))
-                input_frame_rot = input_frame_rot.astype(np.float32) / 255.0
-                input_frame_rot = np.expand_dims(input_frame_rot, axis=0)
+                results = self.region_detector.predict(left_rotated_frame, conf=0.15, verbose=False)[0]
                 
-                interpreter.set_tensor(input_details[0]['index'], input_frame_rot)
-                interpreter.invoke()
-                boxes_output = interpreter.get_tensor(output_details[0]['index'])
-                boxes = boxes_output[0]
-                valid_detections = boxes[boxes[:, 4] > 0.15] if len(boxes.shape) > 1 else []
-                
-                if len(valid_detections) == 0:
+                if results.boxes is None or len(results.boxes) == 0:
                     return 0
                 else:
                     # Adjust coordinates for left rotation
                     frame_height, frame_width = frame.shape[:2]
-                    box = valid_detections[0]
-                    x_center, y_center, w, h = box[0] * frame_width, box[1] * frame_height, box[2] * frame_width, box[3] * frame_height
-                    face_box_coor = [y_center - h/2, frame_height - (x_center + w/2), h, frame_height - (x_center - w/2) - face_box_coor[0]]
+                    box = results.boxes.xyxy[0].cpu().numpy()
+                    face_box_coor = [box[1], frame_height-box[2], box[3], frame_height-box[0]]
             else:
                 # Adjust coordinates for right rotation
                 frame_height, frame_width = frame.shape[:2]
-                box = valid_detections[0]
-                x_center, y_center, w, h = box[0] * frame_width, box[1] * frame_height, box[2] * frame_width, box[3] * frame_height
-                face_box_coor = [frame_width - (x_center + w/2), y_center - h/2, w, h]
+                box = results.boxes.xyxy[0].cpu().numpy()
+                face_box_coor = [frame_width-box[3], box[0], frame_width-box[1], box[2]]
         else:
-            # Use the first detected bounding box
-            box = valid_detections[0]
-            # Convert normalized coordinates to pixel coordinates
-            frame_height, frame_width = frame.shape[:2]
-            x_center, y_center, w, h = box[0] * frame_width, box[1] * frame_height, box[2] * frame_width, box[3] * frame_height
-            x1 = int(x_center - w/2)
-            y1 = int(y_center - h/2)
-            face_box_coor = [x1, y1, int(w), int(h)]  # [x, y, width, height]
+            # Use the detected bounding box (xyxy format -> xywh format)
+            box = results.boxes.xyxy[0].cpu().numpy()
+            x1, y1, x2, y2 = box
+            face_box_coor = [int(x1), int(y1), int(x2-x1), int(y2-y1)]
             
-            # Extract segmentation mask if requested
-            if return_mask and len(output_details) > 1:
-                masks_output = interpreter.get_tensor(output_details[1]['index'])
-                if masks_output is not None and len(masks_output) > 0:
-                    mask = masks_output[0, 0]  # Get first mask from batch
-                    # Resize mask to match frame dimensions
-                    mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
-                    mask = (mask > 0.5).astype(np.uint8)  # Binarize mask
-                    return face_box_coor, mask
+            # Extract segmentation mask if requested for bilateral filtering
+            if return_mask and results.masks is not None:
+                mask = results.masks.data[0].cpu().numpy()
+                # Resize mask to match frame dimensions
+                mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+                mask = (mask > 0.5).astype(np.uint8)  # Binarize mask
+                return face_box_coor, mask
       
-      elif backend == "YOLOv5":
-        frame_height, frame_width = frame.shape[:2]  
-        model = YoloDetector(target_size=None,device='cpu', min_face=80)
-        bboxes, points = model.predict(frame)
-        # print(bboxes[0])
+      elif backend == "YOLO-RegionInpaint":
         
-        if len(bboxes[0]) == 0:
-            # print(f"ERROR: No Face Detected in {filename}")
-            right_rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-            bboxes, points = model.predict(right_rotated_frame)
-            if len(bboxes[0]) == 0:
-                left_rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                bboxes, points = model.predict(left_rotated_frame)
-                if len(bboxes[0]) == 0:
+        model_path = "/srv/data/YU/Neonatal-Facial-Region-Extraction/runs/segment/train/weights/best.pt"
+        if not os.path.exists(model_path):
+            print(f"WARNING: Region detection model not found at {model_path}")
+            print("Falling back to full frame")
+            return [0, 0, frame.shape[1], frame.shape[0]]
+        
+        # Always reinitialize model in each call to ensure it works across multiprocessing
+        if self.region_detector is None:
+            self.region_detector = YOLO(model_path)
+        
+        # YOLO expects BGR format, but frames are stored as RGB in preprocessing pipeline
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        # Run inference with confidence threshold
+        conf_threshold = 0.25
+        results = self.region_detector.predict(frame_bgr, conf=conf_threshold, verbose=False)[0]
+        
+        # Check if any regions detected
+        if results.boxes is None or len(results.boxes) == 0:
+            # Try rotations if no detection
+            right_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_CLOCKWISE)
+            results = self.region_detector.predict(right_rotated_frame, conf=0.15, verbose=False)[0]
+            
+            if results.boxes is None or len(results.boxes) == 0:
+                left_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                results = self.region_detector.predict(left_rotated_frame, conf=0.15, verbose=False)[0]
+                
+                if results.boxes is None or len(results.boxes) == 0:
                     return 0
                 else:
-                    face_box_coor = [bboxes[0][0][1], frame_height-bboxes[0][0][2], bboxes[0][0][3], frame_height-bboxes[0][0][0]]
+                    # Adjust coordinates for left rotation
+                    frame_height, frame_width = frame.shape[:2]
+                    box = results.boxes.xyxy[0].cpu().numpy()
+                    face_box_coor = [box[1], frame_height-box[2], box[3], frame_height-box[0]]
             else:
-                face_box_coor = [frame_width-bboxes[0][0][3], bboxes[0][0][0], frame_width-bboxes[0][0][1], bboxes[0][0][2]]
-            # return 0
-            # face_box_coor = [0, 0, frame.shape[1], frame.shape[0]]  # Use entire frame as fallback
+                # Adjust coordinates for right rotation
+                frame_height, frame_width = frame.shape[:2]
+                box = results.boxes.xyxy[0].cpu().numpy()
+                face_box_coor = [frame_width-box[3], box[0], frame_width-box[1], box[2]]
         else:
-            # print(f"Face Detected in {filename}")
-            face_box_coor = bboxes[0][0] # Use the first detected bounding box
-          
+            # Use the detected bounding box (xyxy format -> xywh format)
+            box = results.boxes.xyxy[0].cpu().numpy()
+            x1, y1, x2, y2 = box
+            face_box_coor = [int(x1), int(y1), int(x2-x1), int(y2-y1)]
+            
+            # Extract segmentation mask if requested for inpainting
+            if return_mask and results.masks is not None:
+                mask = results.masks.data[0].cpu().numpy()
+                # Resize mask to match frame dimensions
+                mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+                mask = (mask > 0.5).astype(np.uint8)  # Binarize mask
+                return face_box_coor, mask
+      
+      elif backend == "YOLO-RegionMean":
+        
+        model_path = "/srv/data/YU/Neonatal-Facial-Region-Extraction/runs/segment/train/weights/best.pt"
+        if not os.path.exists(model_path):
+            print(f"WARNING: Region detection model not found at {model_path}")
+            print("Falling back to full frame")
+            return [0, 0, frame.shape[1], frame.shape[0]]
+        
+        # Always reinitialize model in each call to ensure it works across multiprocessing
+        if self.region_detector is None:
+            self.region_detector = YOLO(model_path)
+        
+        # YOLO expects BGR format, but frames are stored as RGB in preprocessing pipeline
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        # Run inference with confidence threshold
+        conf_threshold = 0.25
+        results = self.region_detector.predict(frame_bgr, conf=conf_threshold, verbose=False)[0]
+        
+        # Check if any regions detected
+        if results.boxes is None or len(results.boxes) == 0:
+            # Try rotations if no detection
+            right_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_CLOCKWISE)
+            results = self.region_detector.predict(right_rotated_frame, conf=0.15, verbose=False)[0]
+            
+            if results.boxes is None or len(results.boxes) == 0:
+                left_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                results = self.region_detector.predict(left_rotated_frame, conf=0.15, verbose=False)[0]
+                
+                if results.boxes is None or len(results.boxes) == 0:
+                    return 0
+                else:
+                    # Adjust coordinates for left rotation
+                    frame_height, frame_width = frame.shape[:2]
+                    box = results.boxes.xyxy[0].cpu().numpy()
+                    face_box_coor = [box[1], frame_height-box[2], box[3], frame_height-box[0]]
+            else:
+                # Adjust coordinates for right rotation
+                frame_height, frame_width = frame.shape[:2]
+                box = results.boxes.xyxy[0].cpu().numpy()
+                face_box_coor = [frame_width-box[3], box[0], frame_width-box[1], box[2]]
+        else:
+            # Use the detected bounding box (xyxy format -> xywh format)
+            box = results.boxes.xyxy[0].cpu().numpy()
+            x1, y1, x2, y2 = box
+            face_box_coor = [int(x1), int(y1), int(x2-x1), int(y2-y1)]
+            
+            # Extract segmentation mask if requested for mean color replacement
+            if return_mask and results.masks is not None:
+                mask = results.masks.data[0].cpu().numpy()
+                # Resize mask to match frame dimensions
+                mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+                mask = (mask > 0.5).astype(np.uint8)  # Binarize mask
+                return face_box_coor, mask
+
+      elif backend in ["YOLO-RegionBlurEyeZero", "YOLO-RegionBlurEyeDual"]:
+
+          # Use separate models: region model from YOLO-RegionBlur + dedicated eye model
+          region_model_path = "/srv/data/YU/Neonatal-Facial-Region-Extraction/runs/segment/train/weights/best.pt"
+          eye_model_path = "/srv/data/YU/eye-region-detection/runs/segment/eye_region_yolov11/weights/best.pt"
+
+          # Check both models exist
+          if not os.path.exists(region_model_path):
+              print(f"WARNING: Region detection model not found at {region_model_path}")
+              print("Falling back to full frame")
+              return [0, 0, frame.shape[1], frame.shape[0]]
+
+          if not os.path.exists(eye_model_path):
+              print(f"WARNING: Eye detection model not found at {eye_model_path}")
+              print("Will use region detection only")
+
+          # Initialize region detector (same as YOLO-RegionBlur)
+          if self.region_detector is None:
+              self.region_detector = YOLO(region_model_path)
+
+          # Initialize eye detector
+          if not hasattr(self, 'eye_detector') or self.eye_detector is None:
+              if os.path.exists(eye_model_path):
+                  self.eye_detector = YOLO(eye_model_path)
+              else:
+                  self.eye_detector = None
+
+          # Convert RGB to BGR for detection
+          frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+          # Step 1: Run region detection (same logic as YOLO-RegionBlur)
+          conf_threshold = 0.25
+          region_results = self.region_detector.predict(frame_bgr, conf=conf_threshold, verbose=False)[0]
+
+          # Check if any regions detected
+          if region_results.boxes is None or len(region_results.boxes) == 0:
+              # Try rotations if no detection
+              right_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_CLOCKWISE)
+              region_results = self.region_detector.predict(right_rotated_frame, conf=0.15, verbose=False)[0]
+
+              if region_results.boxes is None or len(region_results.boxes) == 0:
+                  left_rotated_frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                  region_results = self.region_detector.predict(left_rotated_frame, conf=0.15, verbose=False)[0]
+
+                  if region_results.boxes is None or len(region_results.boxes) == 0:
+                      return 0
+                  else:
+                      # Adjust coordinates for left rotation
+                      frame_height, frame_width = frame.shape[:2]
+                      box = region_results.boxes.xyxy[0].cpu().numpy()
+                      face_box_coor = [box[1], frame_height-box[2], box[3], frame_height-box[0]]
+              else:
+                  # Adjust coordinates for right rotation
+                  frame_height, frame_width = frame.shape[:2]
+                  box = region_results.boxes.xyxy[0].cpu().numpy()
+                  face_box_coor = [frame_width-box[3], box[0], frame_width-box[1], box[2]]
+          else:
+              # Use the detected region bounding box (xyxy format -> xywh format)
+              box = region_results.boxes.xyxy[0].cpu().numpy()
+              x1, y1, x2, y2 = box
+              face_box_coor = [int(x1), int(y1), int(x2-x1), int(y2-y1)]
+
+          # Step 2: Run eye detection if model is available and masks are requested
+          if return_mask and region_results.masks is not None:
+              # Initialize region mask from region detection
+              region_mask = region_results.masks.data[0].cpu().numpy()
+              region_mask = cv2.resize(region_mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+              region_mask = (region_mask > 0.5).astype(np.uint8)
+
+              eye_keep_mask = np.ones((frame.shape[0], frame.shape[1]), dtype=np.uint8)
+              eye_detection_mask = np.zeros_like(eye_keep_mask)
+
+              if self.eye_detector is not None:
+                  eye_results = self.eye_detector.predict(frame_bgr, conf=0.3, verbose=False)[0]
+
+                  if eye_results.boxes is not None and len(eye_results.boxes) > 0 and eye_results.masks is not None:
+                      cls_ids = eye_results.boxes.cls.int().cpu().numpy() if hasattr(eye_results.boxes, 'cls') else np.zeros(len(eye_results.boxes), dtype=int)
+                      allowed_ids = getattr(self, 'eye_class_ids', None) or EYE_CLASS_IDS
+                      allowed_set = set(int(cid) for cid in allowed_ids)
+
+                      for i in range(len(eye_results.boxes)):
+                          if cls_ids[i] not in allowed_set:
+                              continue
+                          eye_mask_data = eye_results.masks.data[i].cpu().numpy()
+                          eye_mask_resized = cv2.resize(eye_mask_data, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+                          eye_mask_binary = (eye_mask_resized > 0.5).astype(np.uint8)
+                          eye_keep_mask = eye_keep_mask & (1 - eye_mask_binary)
+                          eye_detection_mask = np.maximum(eye_detection_mask, eye_mask_binary)
+
+              combined_mask = (region_mask.astype(np.float32) * eye_keep_mask.astype(np.float32)).astype(np.uint8)
+
+              return face_box_coor, (region_mask, combined_mask, eye_detection_mask)
+
+      elif backend == "YOLO-RegionFaceDualBlurNew":
+          model_path = "/srv/data/YU/face-roi-detection/runs/segment/eye_region_yolov11_seg/weights/best.pt"
+
+          if not os.path.exists(model_path):
+              print(f"WARNING: Unified face-region detector not found at {model_path}")
+              print("Falling back to legacy dual-detector pipeline")
+              return self.face_detection(
+                  frame,
+                  "YOLO-RegionFaceDualBlur",
+                  use_larger_box,
+                  larger_box_coef,
+                  filename,
+                  return_mask,
+              )
+
+          if self.face_region_dual_detector is None:
+              self.face_region_dual_detector = YOLO(model_path)
+
+          frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+          results = self.face_region_dual_detector.predict(frame_bgr, conf=0.3, verbose=False)[0]
+
+          if results.boxes is None or len(results.boxes) == 0:
+              return self.face_detection(
+                  frame,
+                  "YOLO-RegionFaceDualBlur",
+                  use_larger_box,
+                  larger_box_coef,
+                  filename,
+                  return_mask,
+              )
+
+          detector_names = getattr(self.face_region_dual_detector, "names", {})
+
+          def collect_ids(names_obj, target_label):
+              ids = []
+              if isinstance(names_obj, dict):
+                  iterable = names_obj.items()
+              elif isinstance(names_obj, (list, tuple)):
+                  iterable = enumerate(names_obj)
+              else:
+                  iterable = []
+              for idx, name in iterable:
+                  if str(name).lower() == target_label:
+                      ids.append(int(idx))
+              return ids
+
+          face_class_ids = collect_ids(detector_names, "face") or [0]
+          region_class_ids = collect_ids(detector_names, "region") or [1]
+
+          frame_height, frame_width = frame.shape[:2]
+          boxes_xyxy = results.boxes.xyxy.cpu().numpy()
+          cls_tensor = getattr(results.boxes, "cls", None)
+          conf_tensor = getattr(results.boxes, "conf", None)
+          cls_ids = cls_tensor.int().cpu().numpy() if cls_tensor is not None else np.zeros(boxes_xyxy.shape[0], dtype=int)
+          confs = conf_tensor.cpu().numpy() if conf_tensor is not None else None
+          has_masks = results.masks is not None and getattr(results.masks, "data", None) is not None
+
+          def box_to_mask(box_xywh):
+              mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+              x, y, w, h = [int(v) for v in box_xywh]
+              x2 = min(frame_width, x + w)
+              y2 = min(frame_height, y + h)
+              x = max(0, x)
+              y = max(0, y)
+              if x2 > x and y2 > y:
+                  mask[y:y2, x:x2] = 1
+              return mask
+
+          best_region = None
+          best_face = None
+
+          for det_idx in range(boxes_xyxy.shape[0]):
+              cls_id = int(cls_ids[det_idx])
+              conf_score = float(confs[det_idx]) if confs is not None else 0.0
+              x1, y1, x2, y2 = boxes_xyxy[det_idx]
+              box_xywh = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
+
+              mask_binary = None
+              if has_masks:
+                  mask_data = results.masks.data[det_idx].cpu().numpy()
+                  mask_resized = cv2.resize(mask_data, (frame_width, frame_height), interpolation=cv2.INTER_LINEAR)
+                  mask_binary = (mask_resized > 0.5).astype(np.uint8)
+
+              entry = {
+                  "box": box_xywh,
+                  "mask": mask_binary,
+                  "conf": conf_score,
+              }
+
+              if cls_id in region_class_ids:
+                  if best_region is None or conf_score > best_region["conf"]:
+                      best_region = entry
+              elif cls_id in face_class_ids:
+                  if best_face is None or conf_score > best_face["conf"]:
+                      best_face = entry
+
+          if best_region is None:
+              return self.face_detection(
+                  frame,
+                  "YOLO-RegionFaceDualBlur",
+                  use_larger_box,
+                  larger_box_coef,
+                  filename,
+                  return_mask,
+              )
+
+          face_box_coor = best_region["box"]
+          region_mask = best_region["mask"] if best_region["mask"] is not None else box_to_mask(face_box_coor)
+
+          if return_mask:
+              if best_face is not None and best_face["mask"] is not None:
+                  face_mask = best_face["mask"]
+              elif best_face is not None:
+                  face_mask = box_to_mask(best_face["box"])
+              else:
+                  face_mask = box_to_mask(face_box_coor)
+              return face_box_coor, (region_mask, face_mask)
+
+          return face_box_coor
+
+      elif backend in ["YOLO-RegionFaceDualBlur", "YOLO-RegionFaceDualZero"]:
+
+          project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+          face_model_path = os.path.join(project_root, "yolo_weights", "face_detector", "best.pt")
+
+          face_mask = None
+          face_box_candidate = None
+
+          frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+          if os.path.exists(face_model_path):
+              if self.face_detector is None:
+                  self.face_detector = YOLO(face_model_path)
+
+              face_results = self.face_detector.predict(frame_bgr, conf=0.35, verbose=False)[0]
+              if face_results.boxes is not None and len(face_results.boxes) > 0:
+                  if hasattr(face_results.boxes, "conf") and face_results.boxes.conf is not None:
+                      confs = face_results.boxes.conf.cpu().numpy()
+                      best_idx = int(np.argmax(confs))
+                  else:
+                      best_idx = 0
+
+                  box = face_results.boxes.xyxy[best_idx].cpu().numpy()
+                  x1, y1, x2, y2 = box
+                  face_box_candidate = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
+
+                  if face_results.masks is not None:
+                      face_mask_data = face_results.masks.data[best_idx].cpu().numpy()
+                      face_mask_resized = cv2.resize(
+                          face_mask_data,
+                          (frame.shape[1], frame.shape[0]),
+                          interpolation=cv2.INTER_LINEAR,
+                      )
+                      face_mask = (face_mask_resized > 0.5).astype(np.uint8)
+                  else:
+                      face_mask = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.uint8)
+                      x1c = max(0, int(np.floor(x1)))
+                      y1c = max(0, int(np.floor(y1)))
+                      x2c = min(frame.shape[1], int(np.ceil(x2)))
+                      y2c = min(frame.shape[0], int(np.ceil(y2)))
+                      face_mask[y1c:y2c, x1c:x2c] = 1
+          else:
+              print(f"WARNING: Face detector model not found at {face_model_path}")
+
+          # Reuse YOLO-RegionBlur for the ROI detection
+          region_detection = self.face_detection(
+              frame,
+              "YOLO-RegionBlur",
+              False,
+              1.0,
+              filename,
+              return_mask,
+          )
+
+          region_mask = None
+          if return_mask and isinstance(region_detection, tuple):
+              face_box_coor, region_mask = region_detection
+          else:
+              face_box_coor = region_detection
+
+          if (face_box_coor is None or (isinstance(face_box_coor, int) and face_box_coor == 0)) and face_box_candidate is not None:
+              face_box_coor = face_box_candidate
+
+          if return_mask:
+              if face_mask is None and isinstance(face_box_coor, (list, tuple)):
+                  x, y, w, h = [int(v) for v in face_box_coor]
+                  face_mask = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.uint8)
+                  x2 = min(frame.shape[1], x + w)
+                  y2 = min(frame.shape[0], y + h)
+                  x1c = max(0, x)
+                  y1c = max(0, y)
+                  if x2 > x1c and y2 > y1c:
+                      face_mask[y1c:y2, x1c:x2] = 1
+              return face_box_coor, (region_mask, face_mask)
+
+      elif backend == "YOLOv5":
+          frame_height, frame_width = frame.shape[:2]
+          model = YoloDetector(target_size=None, device='cpu', min_face=80)
+          bboxes, points = model.predict(frame)
+
+          if len(bboxes[0]) == 0:
+              right_rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+              bboxes, points = model.predict(right_rotated_frame)
+              if len(bboxes[0]) == 0:
+                  left_rotated_frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                  bboxes, points = model.predict(left_rotated_frame)
+                  if len(bboxes[0]) == 0:
+                      return 0
+                  else:
+                      face_box_coor = [bboxes[0][0][1], frame_height-bboxes[0][0][2], bboxes[0][0][3], frame_height-bboxes[0][0][0]]
+              else:
+                  face_box_coor = [frame_width-bboxes[0][0][3], bboxes[0][0][0], frame_width-bboxes[0][0][1], bboxes[0][0][2]]
+          else:
+              face_box_coor = bboxes[0][0]
+
       else:
           raise ValueError("Unsupported face detection backend!")
 
-      if use_larger_box:
-          # print(len(face_box_coor))
-          face_box_coor[0] = max(0, face_box_coor[0] - (larger_box_coef - 1.0) / 2 * face_box_coor[2])
-          face_box_coor[1] = max(0, face_box_coor[1] - (larger_box_coef - 1.0) / 2 * face_box_coor[3])
-          face_box_coor[2] = larger_box_coef * face_box_coor[2]
-          face_box_coor[3] = larger_box_coef * face_box_coor[3]
+      if use_larger_box and isinstance(face_box_coor, (list, tuple, np.ndarray)):
+          # Ensure we operate on a mutable sequence when expanding the box
+          face_box_list = list(face_box_coor)
+          face_box_list[0] = max(0, face_box_list[0] - (larger_box_coef - 1.0) / 2 * face_box_list[2])
+          face_box_list[1] = max(0, face_box_list[1] - (larger_box_coef - 1.0) / 2 * face_box_list[3])
+          face_box_list[2] = larger_box_coef * face_box_list[2]
+          face_box_list[3] = larger_box_coef * face_box_list[3]
+          face_box_coor = face_box_list
       return face_box_coor
 
 
@@ -622,12 +1029,38 @@ class BaseLoader(Dataset):
         # Frame Resizing with optional masking or blurring
         resized_frames = np.zeros((frames.shape[0], height, width, 3))
         
-        # Get segmentation mask from first frame if using YOLO-Region, YOLO-RegionBlur, or YOLO-RegionTFLite backend
+        # Get segmentation mask from first frame if using YOLO-based backends that support masking
         segmentation_mask = None
-        if use_face_detection and backend in ["YOLO-Region", "YOLO-RegionBlur", "YOLO-RegionTFLite"]:
+        combined_mask = None  # For YOLO-RegionBlurEyeZero backend
+        eye_detection_mask = None  # For YOLO-RegionBlurEyeZero and Dual backends
+        face_mask_full = None  # For YOLO-RegionFaceDualBlur variants
+        if use_face_detection and backend in ["YOLO-Region", "YOLO-RegionBlur", "YOLO-RegionFeather", "YOLO-RegionBilateral", "YOLO-RegionInpaint", "YOLO-RegionMean", "YOLO-RegionBlurEyeZero", "YOLO-RegionBlurEyeDual", "YOLO-RegionFaceDualBlur", "YOLO-RegionFaceDualBlurNew", "YOLO-RegionFaceDualZero"]:
             detection_result = self.face_detection(frames[0], backend, use_larger_box, larger_box_coef, filename, return_mask=True)
             if isinstance(detection_result, tuple):
-                _, segmentation_mask = detection_result
+                if backend in ["YOLO-RegionBlurEyeZero", "YOLO-RegionBlurEyeDual"]:
+                    # These backends return (box_coor, (region_mask, combined_mask, eye_detection_mask))
+                    _, mask_tuple = detection_result
+                    if isinstance(mask_tuple, tuple):
+                        tuple_len = len(mask_tuple)
+                        if tuple_len >= 1:
+                            segmentation_mask = mask_tuple[0]
+                        if tuple_len >= 2:
+                            combined_mask = mask_tuple[1]
+                        if tuple_len >= 3:
+                            eye_detection_mask = mask_tuple[2]
+                    else:
+                        segmentation_mask = mask_tuple
+                elif backend in ["YOLO-RegionFaceDualBlur", "YOLO-RegionFaceDualBlurNew", "YOLO-RegionFaceDualZero"]:
+                    _, mask_tuple = detection_result
+                    if isinstance(mask_tuple, tuple):
+                        if len(mask_tuple) >= 1:
+                            segmentation_mask = mask_tuple[0]
+                        if len(mask_tuple) >= 2:
+                            face_mask_full = mask_tuple[1]
+                    else:
+                        segmentation_mask = mask_tuple
+                else:
+                    _, segmentation_mask = detection_result
         
         for i in range(0, frames.shape[0]):
             frame = frames[i].copy()
@@ -648,6 +1081,10 @@ class BaseLoader(Dataset):
                 cropped_frame = frame[max(y, 0):min(y + h, frame.shape[0]),
                                      max(x, 0):min(x + w, frame.shape[1])]
                 
+                # Cache the original crop for any restoration needs
+                original_cropped = frame[max(y, 0):min(y + h, frame.shape[0]),
+                                        max(x, 0):min(x + w, frame.shape[1])]
+
                 # Step 2: Apply mask or blur to cropped frame if available
                 if segmentation_mask is not None:
                     # Crop the mask to the same region
@@ -659,9 +1096,126 @@ class BaseLoader(Dataset):
                         # Expand mask to 3 channels
                         cropped_mask_3ch = np.stack([cropped_mask] * 3, axis=-1)
                         # Apply Gaussian blur to the entire frame
-                        blurred_frame = cv2.GaussianBlur(cropped_frame, (63, 63), 0)
+                        blurred_frame = cv2.blur(cropped_frame, (53, 53), 0)
                         # Combine: use original where mask=1, use blurred where mask=0
                         cropped_frame = cropped_frame * cropped_mask_3ch + blurred_frame * (1 - cropped_mask_3ch)
+                    elif backend == "YOLO-RegionFeather":
+                        # Apply soft feathering with gradual fade-out at mask edges
+                        feather_distance = 20  # Distance in pixels for feathering transition
+                        # Apply Gaussian blur to the mask to create smooth transitions
+                        mask_float = cv2.GaussianBlur(cropped_mask.astype(float), (21, 21), feather_distance/2)
+                        # Expand to 3 channels
+                        mask_float_3ch = np.stack([mask_float] * 3, axis=-1)
+                        # Apply soft feathering: gradually fade out from ROI to background
+                        cropped_frame = (cropped_frame * mask_float_3ch).astype(np.uint8)
+                    elif backend == "YOLO-RegionBilateral":
+                        # Apply bilateral filter to non-ROI regions (edge-preserving blur)
+                        # Preserves important edges while smoothing non-ROI areas
+                        cropped_mask_3ch = np.stack([cropped_mask] * 3, axis=-1)
+                        # Apply bilateral filter: preserves edges, removes noise
+                        # Parameters: d=9 (diameter), sigmaColor=75, sigmaSpace=75
+                        bilateral_filtered = cv2.bilateralFilter(cropped_frame, 9, 75, 75)
+                        # Combine: use original where mask=1, use bilateral filtered where mask=0
+                        cropped_frame = cropped_frame * cropped_mask_3ch + bilateral_filtered * (1 - cropped_mask_3ch)
+                    elif backend == "YOLO-RegionInpaint":
+                        # Apply content-aware inpainting to non-ROI regions
+                        # Removes identifiable features while maintaining structural coherence
+                        # Create inpaint mask: 255 where mask=0 (non-ROI), 0 where mask=1 (ROI)
+                        inpaint_mask = (1 - cropped_mask).astype(np.uint8) * 255
+                        # Apply inpainting using Telea algorithm (fast marching)
+                        # inpaintRadius=3: smaller radius for fine details
+                        cropped_frame = cv2.inpaint(cropped_frame, inpaint_mask, 3, cv2.INPAINT_TELEA)
+                    elif backend == "YOLO-RegionMean":
+                        # Replace non-ROI regions with the mean color of the ROI
+                        # Maintains color consistency and reduces edge artifacts
+                        if np.sum(cropped_mask) > 0:
+                            # Calculate mean color of ROI pixels
+                            roi_mean_color = cropped_frame[cropped_mask > 0].mean(axis=0).astype(np.uint8)
+                            # Create a frame filled with the mean color
+                            mean_color_frame = np.full_like(cropped_frame, roi_mean_color)
+                            # Expand mask to 3 channels
+                            cropped_mask_3ch = np.stack([cropped_mask] * 3, axis=-1)
+                            # Combine: use original where mask=1, use mean color where mask=0
+                            cropped_frame = cropped_frame * cropped_mask_3ch + mean_color_frame * (1 - cropped_mask_3ch)
+                    elif backend == "YOLO-RegionBlurEyeZero":
+                        # Effect pipeline per frame:
+                        # 1) Blur the full frame first
+                        # 2) Paste original pixels back for detected 'region' areas
+                        # 3) Zero out detected 'eye' areas to black
+                        
+                        # Step 1: Blur the full frame
+                        blurred_frame = cv2.GaussianBlur(cropped_frame, (21, 21), 0)
+                        cropped_frame = blurred_frame.copy()
+                        
+                        # Step 2: Paste original pixels back for detected 'region' areas
+                        cropped_mask_3ch = np.stack([cropped_mask] * 3, axis=-1)
+                        # Get original frame region for this crop
+                        # Restore region pixels from original frame
+                        cropped_frame[cropped_mask > 0] = original_cropped[cropped_mask > 0]
+                        
+                        # Step 3: Replace detected eye areas with their mean color
+                        if combined_mask is not None:
+                            cropped_combined_mask = combined_mask[max(y, 0):min(y + h, frame.shape[0]),
+                                                                   max(x, 0):min(x + w, frame.shape[1])]
+                            # Eyes exist where combined mask removed region pixels
+                            eye_mask = (cropped_combined_mask == 0) & (cropped_mask > 0)
+                            if np.any(eye_mask):
+                                eye_pixels = original_cropped[eye_mask]
+                                mean_color = np.clip(eye_pixels.mean(axis=0), 0, 255).astype(cropped_frame.dtype)
+                                cropped_frame[eye_mask] = mean_color
+                    elif backend == "YOLO-RegionBlurEyeDual":
+                        # Similar pipeline with dual blur levels:
+                        # 1) Blur everything lightly (non-ROI)
+                        # 2) Restore region pixels
+                        # 3) Apply heavy blur to detected eye regions
+
+                        low_kernel = 21 | 1
+                        high_kernel = 53 | 1
+                        blurred_frame = cv2.GaussianBlur(cropped_frame, (low_kernel, low_kernel), 0)
+                        cropped_frame = blurred_frame.copy()
+
+                        cropped_mask_bool = cropped_mask.astype(bool)
+                        cropped_frame[cropped_mask_bool] = original_cropped[cropped_mask_bool]
+
+                        if eye_detection_mask is not None:
+                            cropped_eye_mask = eye_detection_mask[max(y, 0):min(y + h, frame.shape[0]),
+                                                                  max(x, 0):min(x + w, frame.shape[1])]
+                            eye_mask_bool = (cropped_eye_mask > 0) & cropped_mask_bool
+                        else:
+                            eye_mask_bool = np.zeros_like(cropped_mask_bool, dtype=bool)
+
+                        if np.any(eye_mask_bool):
+                            heavy_blur = cv2.GaussianBlur(original_cropped, (high_kernel, high_kernel), 0)
+                            cropped_frame[eye_mask_bool] = heavy_blur[eye_mask_bool]
+                    elif backend in ["YOLO-RegionFaceDualBlur", "YOLO-RegionFaceDualBlurNew"]:
+                        # Two-level blur: heavy blur for face-only areas, base blur elsewhere
+                        cropped_mask_bool = cropped_mask.astype(bool)
+                        base_blurred = cv2.GaussianBlur(cropped_frame, (43, 43), 0)
+                        cropped_frame = base_blurred.copy()
+                        cropped_frame[cropped_mask_bool] = original_cropped[cropped_mask_bool]
+
+                        if face_mask_full is not None:
+                            cropped_face_mask = face_mask_full[max(y, 0):min(y + h, frame.shape[0]),
+                                                               max(x, 0):min(x + w, frame.shape[1])]
+                            face_mask_bool = cropped_face_mask.astype(bool)
+                            face_only_mask = face_mask_bool & (~cropped_mask_bool)
+                            if np.any(face_only_mask):
+                                heavy_blur = cv2.GaussianBlur(original_cropped, (83, 83), 0)
+                                cropped_frame[face_only_mask] = heavy_blur[face_only_mask]
+                    elif backend == "YOLO-RegionFaceDualZero":
+                        # Keep ROI sharp, blur background, zero face-only areas outside ROI
+                        cropped_mask_bool = cropped_mask.astype(bool)
+                        base_blurred = cv2.GaussianBlur(cropped_frame, (53, 53), 0)
+                        cropped_frame = base_blurred.copy()
+                        cropped_frame[cropped_mask_bool] = original_cropped[cropped_mask_bool]
+
+                        if face_mask_full is not None:
+                            cropped_face_mask = face_mask_full[max(y, 0):min(y + h, frame.shape[0]),
+                                                               max(x, 0):min(x + w, frame.shape[1])]
+                            face_mask_bool = cropped_face_mask.astype(bool)
+                            face_only_mask = face_mask_bool & (~cropped_mask_bool)
+                            if np.any(face_only_mask):
+                                cropped_frame[face_only_mask] = 0
                     else:
                         # YOLO-Region: Apply mask to zero out non-ROI regions
                         cropped_mask_3ch = np.stack([cropped_mask] * 3, axis=-1)
