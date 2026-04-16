@@ -102,9 +102,7 @@ class BlandAltman():
 
         fig = plt.figure(figsize=figure_size)
         ax=fig.add_axes([0,0,1,1])
-        xy = np.vstack([self.gold_std,self.new_measure])
-        z = gaussian_kde(xy)(xy)
-        ax.scatter(self.gold_std,self.new_measure, c=z, s=50)
+        ax.scatter(self.gold_std,self.new_measure, color='darkblue', s=50, alpha=0.6)
         x_vals = np.array(ax.get_xlim())
         ax.plot(x_vals,x_vals,'--',color='black', label='Line of Slope = 1')
         ax.set_xlabel(x_label)
@@ -131,9 +129,7 @@ class BlandAltman():
 
         fig = plt.figure(figsize=figure_size)
         ax = fig.add_axes([0,0,1,1])
-        xy = np.vstack([avgs,diffs])
-        z = gaussian_kde(xy)(xy)
-        ax.scatter(avgs,diffs, c=z, label='Observations')
+        ax.scatter(avgs,diffs, color='darkblue', alpha=0.6, label='Observations')
         x_vals = np.array(ax.get_xlim())
         ax.axhline(self.mean_error,color='black',label='Mean Error')
         ax.axhline(self.CI95[0],color='black',linestyle='--',label='+95% Confidence Interval')
